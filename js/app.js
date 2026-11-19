@@ -100,12 +100,29 @@ function save() {
     console.error(e);
   }
 }
-function exportBackup() {
+async function exportBackup() {
   const payload = { app: APP_NAME, version: FORMAT_VERSION, exportedAt: nowISO(), data: DATA };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const json = JSON.stringify(payload, null, 2);
+  const filename = 'SAONA_WORKSPACE_sauvegarde.json';
+  // Dans une page claude.ai, le téléchargement passe par la capacité « downloads » (confirmation du visiteur).
+  let downloads = null;
+  try { downloads = window.claude && typeof window.claude.use === 'function' ? await window.claude.use('downloads') : null; } catch { downloads = null; }
+  if (downloads) {
+    try {
+      await downloads.save({ filename, data: json });
+      toast('Sauvegarde exportée');
+    } catch (e) {
+      const code = e && e.code;
+      if (code === 'declined') toast('Export annulé');
+      else if (code === 'rate_limited') toast('Une demande d’enregistrement est déjà ouverte');
+      else notice(`L’export n’est pas disponible ici (${code || 'erreur inconnue'}).`, 'Export impossible');
+    }
+    return;
+  }
+  const blob = new Blob([json], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'SAONA_WORKSPACE_sauvegarde.json';
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -425,6 +442,16 @@ function openModal(title, bodyHtml, buttons, onSubmit) {
 }
 function closeModal() { $('#modal').close(); modalHandler = null; }
 
+/* Confirmations et messages intégrés à la page (alert/confirm sont bloqués dans certains cadres). */
+function askConfirm(message, onYes, okLabel = 'Supprimer', danger = true) {
+  openModal('Confirmation', `<p>${esc(message)}</p>`,
+    `<button type="button" class="btn ghost" data-close>Annuler</button><button type="submit" class="btn ${danger ? 'danger' : ''}">${esc(okLabel)}</button>`,
+    () => onYes());
+}
+function notice(message, title = 'Information') {
+  openModal(title, `<p>${esc(message)}</p>`, '<button type="submit" class="btn">OK</button>', null);
+}
+
 function openItemForm(collKey, item, presets = {}) {
   const def = COLLECTIONS[collKey];
   const isNew = !item;
@@ -465,14 +492,15 @@ function deleteItem(collKey, id) {
   const item = DATA[collKey].find(x => String(x.id) === String(id));
   if (!item) return;
   const blocker = def.canDelete && def.canDelete(item);
-  if (blocker) { alert(blocker); return; }
+  if (blocker) { notice(blocker, 'Suppression impossible'); return; }
   const label = item.title || item.name || item.company || 'cet élément';
-  if (!confirm(`Supprimer « ${label} » ? Cette action est définitive.`)) return;
-  DATA[collKey] = DATA[collKey].filter(x => x !== item);
-  if (def.afterDelete) def.afterDelete(item);
-  save();
-  toast('Supprimé');
-  render();
+  askConfirm(`Supprimer « ${label} » ? Cette action est définitive.`, () => {
+    DATA[collKey] = DATA[collKey].filter(x => x !== item);
+    if (def.afterDelete) def.afterDelete(item);
+    save();
+    toast('Supprimé');
+    render();
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -604,13 +632,18 @@ function renderNav(active) {
   };
   $('#nav').innerHTML = NAV.map(([group, links]) => `
     <div class="nav-group"><div class="nav-group-title">${esc(group)}</div>
-      ${links.map(([r, l]) => `<a class="nav-link ${active === r ? 'active' : ''}" href="#/${r}">${esc(l)}${counts[r] != null ? `<span class="nav-count">${counts[r]}</span>` : ''}</a>`).join('')}
+      ${links.map(([r, l]) => `<a class="nav-link ${active === r ? 'active' : ''}" href="#${r}">${esc(l)}${counts[r] != null ? `<span class="nav-count">${counts[r]}</span>` : ''}</a>`).join('')}
     </div>`).join('');
 }
 
+/* Adresses de page simples (#taches, #fiche-<id>, #pilote-<id>) : seule forme transmise par les liens claude.ai. */
 function parseRoute() {
-  const parts = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/').map(decodeURIComponent);
-  return { name: parts[0], arg: parts[1] };
+  const h = decodeURIComponent(location.hash.replace(/^#\/?/, '')) || 'dashboard';
+  let m = /^fiche-(.+)$/.exec(h);
+  if (m) return { name: 'org', arg: m[1] };
+  m = /^pilote-(.+)$/.exec(h);
+  if (m) return { name: 'pilot', arg: m[1] };
+  return { name: h.split('/')[0], arg: undefined };
 }
 
 /* ------------------------------------------------------------------ */
@@ -625,7 +658,7 @@ function viewCollection(collKey) {
   if (def.sort) rows.sort(def.sort);
   if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
   const extraActions = collKey === 'preDiagnostics'
-    ? r => `<a class="btn small ghost" href="#/pilot/${encodeURIComponent(r.id)}">Pilote</a>`
+    ? r => `<a class="btn small ghost" href="#pilote-${encodeURIComponent(r.id)}">Pilote</a>`
     : () => '';
   const head = def.columns.map(c => `<th>${esc(COLUMN_LABELS[c] || (fieldOf(collKey, c) || {}).label || c)}</th>`).join('');
   const body = rows.map(r => {
@@ -689,26 +722,26 @@ function viewDashboard() {
       <div class="stat"><div class="stat-value">${lessonsDone}/${DATA.lessons.length}</div><div class="stat-label">Modules académie terminés</div></div>
     </div>
     <div class="grid">
-      <div class="card"><div class="card-head"><h2>Priorités</h2><a href="#/tasks" class="small">Toutes les tâches</a></div>
+      <div class="card"><div class="card-head"><h2>Priorités</h2><a href="#tasks" class="small">Toutes les tâches</a></div>
         ${high.length ? `<ul class="list">${high.map(t => `<li><div class="row"><span>${esc(t.title)}</span><span class="badge">${esc(t.owner)}</span></div><div class="small muted">${esc(t.project)}</div></li>`).join('')}</ul>` : '<p class="muted">Aucune tâche haute priorité ouverte.</p>'}
       </div>
-      <div class="card"><div class="card-head"><h2>À venir</h2><a href="#/events" class="small">Agenda</a></div>
+      <div class="card"><div class="card-head"><h2>À venir</h2><a href="#events" class="small">Agenda</a></div>
         ${upcoming.length ? `<ul class="list">${upcoming.map(e => `<li><div class="row"><strong>${esc(fmtDate(e.date))}${e.time ? ' · ' + esc(e.time) : ''}</strong><span class="badge">${esc(e.category)}</span></div><div>${esc(e.title)}</div>${e.notes ? `<div class="small muted">${esc(e.notes)}</div>` : ''}</li>`).join('')}</ul>` : '<p class="muted">Aucun événement à venir.</p>'}
       </div>
-      <div class="card"><div class="card-head"><h2>Pipeline prospects</h2><a href="#/prospects" class="small">Prospects</a></div>
+      <div class="card"><div class="card-head"><h2>Pipeline prospects</h2><a href="#prospects" class="small">Prospects</a></div>
         ${byStage.length ? `<ul class="list">${byStage.map(([s, n]) => `<li class="row"><span>${esc(s)}</span><strong>${n}</strong></li>`).join('')}</ul>` : '<p class="muted">Aucun prospect.</p>'}
       </div>
-      <div class="card"><div class="card-head"><h2>CRM — à traiter</h2><a href="#/crm" class="small">CRM</a></div>
+      <div class="card"><div class="card-head"><h2>CRM — à traiter</h2><a href="#crm" class="small">CRM</a></div>
         <ul class="list">
           ${DATA.strategicProjects.map(p => {
             const org = DATA.organizations.find(o => o.id === p.orgId);
-            return `<li><div class="row"><a href="#/org/${encodeURIComponent(p.orgId)}">${esc(org ? org.name : p.orgId)}</a><span class="badge ${badgeClass(p.stage)}">${esc(p.stage)}</span></div><div class="small muted">${esc(p.nextAction)}</div></li>`;
+            return `<li><div class="row"><a href="#fiche-${encodeURIComponent(p.orgId)}">${esc(org ? org.name : p.orgId)}</a><span class="badge ${badgeClass(p.stage)}">${esc(p.stage)}</span></div><div class="small muted">${esc(p.nextAction)}</div></li>`;
           }).join('') || '<li class="muted">Aucun projet stratégique.</li>'}
         </ul>
         ${pendingAnalyses.length ? `<p class="small">${pendingAnalyses.length} analyse(s) en attente de validation.</p>` : ''}
       </div>
     </div>
-    <div class="card"><div class="card-head"><h2>Projets</h2><a href="#/projects" class="small">Tous les projets</a></div>
+    <div class="card"><div class="card-head"><h2>Projets</h2><a href="#projects" class="small">Tous les projets</a></div>
       <ul class="list">${DATA.projects.map(p => `<li><div class="row"><strong>${esc(p.name)}</strong><span class="badge ${badgeClass(p.status)}">${esc(p.status)}</span></div><div class="row" style="flex-wrap:nowrap"><div class="progress" style="flex:1"><div style="width:${Number(p.progress) || 0}%"></div></div><span class="small">${Number(p.progress) || 0} %</span></div></li>`).join('') || '<li class="muted">Aucun projet.</li>'}</ul>
     </div>`;
 }
@@ -724,7 +757,7 @@ function viewCrm() {
     <div class="grid">${orgs.map(o => {
       const sps = DATA.strategicProjects.filter(p => p.orgId === o.id);
       const cts = DATA.crmContacts.filter(c => c.orgId === o.id);
-      return `<a class="card" href="#/org/${encodeURIComponent(o.id)}" style="text-decoration:none;color:inherit;display:block">
+      return `<a class="card" href="#fiche-${encodeURIComponent(o.id)}" style="text-decoration:none;color:inherit;display:block">
         <div class="card-head"><h2>${esc(o.name)}</h2><span class="badge accent">${esc(o.relationship)}</span></div>
         <div class="small muted">${esc(o.sector)}</div>
         <p class="small">${esc(o.notes)}</p>
@@ -774,12 +807,12 @@ function proposalHtml(pr) {
 
 function viewOrg(orgId) {
   const o = DATA.organizations.find(x => x.id === orgId);
-  if (!o) return '<div class="empty">Organisation introuvable. <a href="#/crm">Retour au CRM</a></div>';
+  if (!o) return '<div class="empty">Organisation introuvable. <a href="#crm">Retour au CRM</a></div>';
   const contacts = DATA.crmContacts.filter(c => c.orgId === o.id);
   const sps = DATA.strategicProjects.filter(p => p.orgId === o.id);
   const events = DATA.crmEvents.filter(e => e.orgId === o.id).sort((a, b) => String(b.at).localeCompare(String(a.at)));
   return `
-    <p><a href="#/crm">← CRM</a></p>
+    <p><a href="#crm">← CRM</a></p>
     <div class="card">
       <div class="card-head"><h2>${esc(o.name)}</h2>
         <div class="row"><button class="btn small ghost" id="editOrg">Modifier</button><button class="btn small danger" id="delOrg">Supprimer</button></div></div>
@@ -811,7 +844,7 @@ function viewOrg(orgId) {
         <dl class="kv">
           <dt>Objectif</dt><dd>${esc(p.objective)}</dd>
           <dt>Prochaine action</dt><dd>${esc(p.nextAction)}</dd>
-          <dt>Pré-diagnostic</dt><dd>${pre ? `<a href="#/pilot/${encodeURIComponent(pre.id)}">${esc(pre.company)} — voir le pilote</a>` : '<span class="muted">Non lié</span>'}</dd>
+          <dt>Pré-diagnostic</dt><dd>${pre ? `<a href="#pilote-${encodeURIComponent(pre.id)}">${esc(pre.company)} — voir le pilote</a>` : '<span class="muted">Non lié</span>'}</dd>
         </dl>
         <div class="row" style="justify-content:flex-end;margin-top:12px">
           <button class="btn small" data-analyze="${esc(p.id)}" ${pre ? '' : 'disabled title="Liez un pré-diagnostic pour générer une synthèse"'}>Générer une synthèse</button>
@@ -835,12 +868,12 @@ function bindOrg(orgId) {
   $('#editOrg').addEventListener('click', () => openItemForm('organizations', o));
   $('#delOrg').addEventListener('click', () => {
     const blocker = COLLECTIONS.organizations.canDelete(o);
-    if (blocker) { alert(blocker); return; }
-    if (confirm(`Supprimer « ${o.name} » ?`)) {
+    if (blocker) { notice(blocker, 'Suppression impossible'); return; }
+    askConfirm(`Supprimer « ${o.name} » ? Cette action est définitive.`, () => {
       DATA.organizations = DATA.organizations.filter(x => x !== o);
       DATA.crmEvents = DATA.crmEvents.filter(e => e.orgId !== o.id);
-      save(); location.hash = '#/crm';
-    }
+      save(); location.hash = '#crm';
+    });
   });
   $('#addContact').addEventListener('click', () => openItemForm('crmContacts', null, { orgId }));
   bindRowActions('crmContacts', $('#contactsCard'));
@@ -854,7 +887,7 @@ function bindOrg(orgId) {
       generateAnalysis(p);
       p.updatedAt = nowISO();
       save(); toast('Synthèse générée — à valider'); render();
-    } catch (e) { alert(e.message); }
+    } catch (e) { notice(e.message, 'Synthèse impossible'); }
   }));
 
   $$('[data-validate]').forEach(b => b.addEventListener('click', () => {
@@ -892,10 +925,11 @@ function bindOrg(orgId) {
   $$('[data-del-analysis]').forEach(b => b.addEventListener('click', () => {
     const id = b.dataset.delAnalysis;
     const n = DATA.crmProposals.filter(p => p.analysisId === id).length;
-    if (n) { alert(`${n} proposition(s) reposent sur cette analyse. Supprimez-les d’abord.`); return; }
-    if (!confirm('Supprimer cette synthèse ?')) return;
-    DATA.crmAnalyses = DATA.crmAnalyses.filter(a => a.id !== id);
-    save(); render();
+    if (n) { notice(`${n} proposition(s) reposent sur cette analyse. Supprimez-les d’abord.`, 'Suppression impossible'); return; }
+    askConfirm('Supprimer cette synthèse ?', () => {
+      DATA.crmAnalyses = DATA.crmAnalyses.filter(a => a.id !== id);
+      save(); render();
+    });
   }));
 
   $$('[data-proposal-status]').forEach(s => s.addEventListener('change', () => {
@@ -907,25 +941,34 @@ function bindOrg(orgId) {
   }));
   $$('[data-copy]').forEach(b => b.addEventListener('click', async () => {
     const pr = DATA.crmProposals.find(x => x.id === b.dataset.copy);
-    try { await navigator.clipboard.writeText(pr.text); toast('Texte copié'); } catch { alert('Copie impossible dans ce navigateur.'); }
+    try {
+      await navigator.clipboard.writeText(pr.text);
+      toast('Texte copié');
+    } catch {
+      openModal('Copier le texte', `<p class="small muted">La copie automatique est indisponible ici : le texte est sélectionné, copiez-le avec Ctrl+C (ou ⌘+C).</p><textarea id="copyText" readonly style="min-height:260px">${esc(pr.text)}</textarea>`,
+        '<button type="submit" class="btn">Fermer</button>', null);
+      const ta = $('#copyText'); ta.focus(); ta.select();
+    }
   }));
   $$('[data-del-proposal]').forEach(b => b.addEventListener('click', () => {
-    if (!confirm('Supprimer cette proposition ?')) return;
-    DATA.crmProposals = DATA.crmProposals.filter(x => x.id !== b.dataset.delProposal);
-    save(); render();
+    const id = b.dataset.delProposal;
+    askConfirm('Supprimer cette proposition ?', () => {
+      DATA.crmProposals = DATA.crmProposals.filter(x => x.id !== id);
+      save(); render();
+    });
   }));
 }
 
 function viewPilot(preId) {
   const pre = DATA.preDiagnostics.find(p => p.id === preId);
-  if (!pre) return '<div class="empty">Pré-diagnostic introuvable. <a href="#/preDiagnostics">Retour</a></div>';
+  if (!pre) return '<div class="empty">Pré-diagnostic introuvable. <a href="#preDiagnostics">Retour</a></div>';
   const pilot = DATA.saonaPilots.find(p => p.preId === preId) || ensurePilot(pre);
   const done = pilot.done || {};
   const doneCount = PILOT_STEPS.filter(([k]) => done[k]).length;
   const sp = DATA.strategicProjects.find(p => p.preId === preId);
   const a = pre.answers || {};
   return `
-    <p><a href="#/preDiagnostics">← Pré-diagnostics</a></p>
+    <p><a href="#preDiagnostics">← Pré-diagnostics</a></p>
     <div class="card">
       <div class="card-head"><div><h2>${esc(pre.company)}</h2><div class="small muted">${esc(pre.contact)} · mis à jour le ${esc(fmtDateTime(pre.updatedAt))}</div></div>
         <div class="row"><span class="badge">${esc(pre.evidence)}</span><button class="btn small ghost" id="editPre">Modifier</button></div></div>
@@ -935,7 +978,7 @@ function viewPilot(preId) {
         ${pre.notes ? `<dt>Notes</dt><dd>${esc(pre.notes)}</dd>` : ''}
       </dl>
       <div class="row" style="justify-content:flex-end;margin-top:12px">
-        ${sp ? `<a class="btn small ghost" href="#/org/${encodeURIComponent(sp.orgId)}">Voir le projet CRM</a>` : '<button class="btn small" id="linkCrm">Créer le projet CRM</button>'}
+        ${sp ? `<a class="btn small ghost" href="#fiche-${encodeURIComponent(sp.orgId)}">Voir le projet CRM</a>` : '<button class="btn small" id="linkCrm">Créer le projet CRM</button>'}
       </div>
     </div>
     <div class="card">
@@ -985,7 +1028,7 @@ function bindPilot(preId) {
     DATA.strategicProjects.push(sp);
     logCrmEvent(org.id, sp.id, 'Projet créé', `Depuis le pré-diagnostic ${pre.id}`);
     save();
-    location.hash = `#/org/${encodeURIComponent(org.id)}`;
+    location.hash = `#fiche-${encodeURIComponent(org.id)}`;
   });
 }
 
@@ -1021,19 +1064,28 @@ function viewData() {
 function bindData() {
   $('#importFile').addEventListener('change', e => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
-    if (!confirm('Remplacer toutes les données actuelles par ce fichier ?')) { e.target.value = ''; return; }
-    const reader = new FileReader();
-    reader.onload = () => {
-      try { importBackup(reader.result); toast('Sauvegarde importée'); render(); } catch (err) { alert(err.message); }
-      e.target.value = '';
+    const doImport = () => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try { importBackup(reader.result); toast('Sauvegarde importée'); location.hash = '#dashboard'; render(); }
+        catch (err) { notice(err.message, 'Import impossible'); }
+      };
+      reader.onerror = () => notice('Lecture du fichier impossible.', 'Import impossible');
+      reader.readAsText(file, 'utf-8');
     };
-    reader.readAsText(file, 'utf-8');
+    if (COLLECTION_KEYS.some(k => DATA[k].length)) {
+      askConfirm(`Remplacer toutes les données actuelles par « ${file.name} » ?`, doImport, 'Remplacer');
+    } else {
+      doImport();
+    }
   });
   $('#exportBtn2').addEventListener('click', exportBackup);
   $('#resetBtn').addEventListener('click', () => {
-    if (!confirm('Effacer définitivement toutes les données de ce navigateur ?')) return;
-    DATA = emptyData(); save(); toast('Données effacées'); render();
+    askConfirm('Effacer définitivement toutes les données de ce navigateur ?', () => {
+      DATA = emptyData(); save(); toast('Données effacées'); render();
+    }, 'Tout effacer');
   });
 }
 
@@ -1057,7 +1109,7 @@ function render() {
   else if (name === 'pilot') { view.innerHTML = viewPilot(arg); bindPilot(arg); }
   else if (name === 'data') { view.innerHTML = viewData(); bindData(); }
   else if (COLLECTIONS[name]) { view.innerHTML = viewCollection(name); bindCollection(name); }
-  else { view.innerHTML = '<div class="empty">Page introuvable. <a href="#/dashboard">Tableau de bord</a></div>'; }
+  else { view.innerHTML = '<div class="empty">Page introuvable. <a href="#dashboard">Tableau de bord</a></div>'; }
   $('#pageTitle').textContent = title;
   document.title = `${title} · SAONA Workspace`;
   $('#sidebar').classList.remove('open');
@@ -1081,7 +1133,7 @@ function init() {
   $('#exportBtn').addEventListener('click', exportBackup);
   $('#menuBtn').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
   window.addEventListener('hashchange', render);
-  if (!COLLECTION_KEYS.some(k => DATA[k].length) && !location.hash) location.hash = '#/data';
+  if (!COLLECTION_KEYS.some(k => DATA[k].length) && !location.hash) location.hash = '#data';
   render();
 }
 
